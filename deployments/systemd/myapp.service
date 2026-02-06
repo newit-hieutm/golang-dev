@@ -1,0 +1,45 @@
+[Unit]
+Description=MyApp Go Application
+Documentation=https://github.com/yourorg/myapp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=myapp
+Group=myapp
+
+WorkingDirectory=/opt/myapp
+ExecStart=/opt/myapp/bin/myapp
+
+Restart=always
+RestartSec=10
+StartLimitBurst=3
+StartLimitInterval=60
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/myapp/logs /opt/myapp/data
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Environment variables
+Environment="PORT=8080"
+Environment="ENV=production"
+
+# Logging
+StandardOutput=append:/opt/myapp/logs/app.log
+StandardError=append:/opt/myapp/logs/error.log
+
+# Graceful shutdown
+TimeoutStopSec=35
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

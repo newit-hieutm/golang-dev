@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Stack 3: Application Infrastructure (ALB, ASG, Launch Template) - Updated for Private Subnets"
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: myapp
+  Environment:
+    Type: String
+    Default: staging
+    AllowedValues:
+      - staging
+      - production
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair
+  MinSize:
+    Type: Number
+    Default: 1
+  MaxSize:
+    Type: Number
+    Default: 2
+  DesiredCapacity:
+    Type: Number
+    Default: 1
+
+Resources:
+  # ==========================================
+  # Load Balancer
+  # ==========================================
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ApplicationName}-${Environment}-alb
+      Scheme: internet-facing
+      SecurityGroups:
+        - Fn::ImportValue: !Sub ${Environment}-ALBSecurityGroup
+      Subnets:
+        - Fn::ImportValue: !Sub ${Environment}-PublicSubnet1
+        - Fn::ImportValue: !Sub ${Environment}-PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${ApplicationName}-${Environment}-alb
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ApplicationName}-${Environment}-tg-v2
+      Port: 80
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub ${Environment}-VpcId
+      HealthCheckEnabled: true
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetType: instance
+      Tags:
+        - Key: Name
+          Value: !Sub ${ApplicationName}-${Environment}-tg
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ==========================================
+  # Launch Template
+  # ==========================================
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${ApplicationName}-${Environment}-lt
+      LaunchTemplateData:
+        ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn:
+            Fn::ImportValue: !Sub ${Environment}-EC2InstanceProfileArn
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub ${Environment}-EC2SecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+            yum update -y
+
+            # Install Nginx
+            amazon-linux-extras install nginx1 -y
+            systemctl enable nginx
+
+            # Configure Nginx Reverse Proxy
+            cat <<EOF > /etc/nginx/conf.d/myapp.conf
+            server {
+                listen 80;
+                server_name _;
+
+                location / {
+                    proxy_pass http://localhost:8080;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                }
+                
+                location /health {
+                    access_log off;
+                    proxy_pass http://localhost:8080/health;
+                }
+            }
+            EOF
+
+            # Hide Nginx version
+            sed -i 's/# server_tokens/server_tokens/' /etc/nginx/nginx.conf
+            sed -i 's/server_tokens on;/server_tokens off;/' /etc/nginx/nginx.conf
+
+            # Remove default server if exists to avoid conflicts
+            rm -f /etc/nginx/conf.d/default.conf
+
+            # Start Nginx
+            systemctl start nginx
+
+            # Install CodeDeploy Agent
+            yum install -y ruby wget
+            cd /home/ec2-user
+            wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+            chmod +x ./install
+            ./install auto
+            systemctl enable codedeploy-agent
+            systemctl start codedeploy-agent
+
+            # App Setup
+            useradd -r -s /bin/false myapp || true
+            mkdir -p /opt/myapp
+            chown myapp:myapp /opt/myapp
+
+  # ==========================================
+  # Auto Scaling Group (Private Subnets)
+  # ==========================================
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${ApplicationName}-${Environment}-asg
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      VPCZoneIdentifier:
+        # Use Private Subnets for App Security
+        - Fn::ImportValue: !Sub ${Environment}-PrivateSubnet1
+        - Fn::ImportValue: !Sub ${Environment}-PrivateSubnet2
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${ApplicationName}-${Environment}-instance
+          PropagateAtLaunch: true
+
+Outputs:
+  ALBDNSName:
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${Environment}-ALBDNSName
+  ASGName:
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub ${Environment}-ASGName
+  TargetGroupName:
+    Value: !GetAtt TargetGroup.TargetGroupName
+    Export:
+      Name: !Sub ${Environment}-TargetGroupName
