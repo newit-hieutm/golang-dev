@@ -1,0 +1,85 @@
+name: Deploy to AWS
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: myapp-staging-artifacts-332809474715
+  APP_NAME: myapp
+  ENV_NAME: staging
+
+jobs:
+  build-and-deploy:
+    # Only run if the PR was actually merged (not closed without merge)
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.21"
+
+      - name: Get version info
+        id: version
+        run: |
+          echo "VERSION=$(git describe --tags --always --dirty || echo 'v0.0.0')" >> $GITHUB_OUTPUT
+          echo "COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "TIME=$(date -u '+%Y-%m-%d_%H:%M:%S')" >> $GITHUB_OUTPUT
+
+      - name: Build Binary
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
+            -ldflags "-X main.Version=${{ steps.version.outputs.VERSION }} -X main.Commit=${{ steps.version.outputs.COMMIT }} -X main.BuildTime=${{ steps.version.outputs.TIME }} -s -w" \
+            -o bin/myapp cmd/api/main.go
+
+      - name: Create Version File
+        run: |
+          echo '{"version":"${{ steps.version.outputs.VERSION }}","commit":"${{ steps.version.outputs.COMMIT }}","buildTime":"${{ steps.version.outputs.TIME }}"}' > version.json
+
+      - name: Prepare Deployment Package
+        run: |
+          mkdir package
+          cp bin/myapp package/
+          cp version.json package/
+          cp -r deployments/* package/
+          # Check structure
+          ls -R package/
+
+      - name: Zip Artifact
+        run: |
+          cd package
+          zip -r ../${{ env.APP_NAME }}-${{ env.ENV_NAME }}.zip .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check S3 Connection
+        run: aws s3 ls s3://${{ env.S3_BUCKET }}
+
+      - name: Upload Artifact to S3
+        run: |
+          aws s3 cp ${{ env.APP_NAME }}-${{ env.ENV_NAME }}.zip s3://${{ env.S3_BUCKET }}/${{ env.ENV_NAME }}/${{ env.APP_NAME }}-${{ env.ENV_NAME }}.zip
+
+      - name: Verify S3 Upload
+        run: |
+          if aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.ENV_NAME }}/${{ env.APP_NAME }}-${{ env.ENV_NAME }}.zip; then
+            echo "✅ Artifact successfully verified on S3."
+          else
+            echo "❌ Error: Artifact not found on S3 after upload!"
+            exit 1
+          fi
+
+      - name: Trigger Pipeline Info
+        run: |
+          echo "Artifact verified. AWS CodePipeline Source stage (S3) will detect the update event automatically."

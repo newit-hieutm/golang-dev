@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Stack 4: CI/CD Pipeline (CodeDeploy, CodePipeline)"
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: myapp
+  Environment:
+    Type: String
+    Default: staging
+
+Resources:
+  # ==========================================
+  # CodeDeploy
+  # ==========================================
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub ${ApplicationName}-${Environment}
+      ComputePlatform: Server
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub ${ApplicationName}-${Environment}-dg
+      ServiceRoleArn:
+        Fn::ImportValue: !Sub ${Environment}-CodeDeployRoleArn
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      AutoScalingGroups:
+        - Fn::ImportValue: !Sub ${Environment}-ASGName
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name:
+              Fn::ImportValue: !Sub ${Environment}-TargetGroupName
+
+  # ==========================================
+  # CodePipeline
+  # ==========================================
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${ApplicationName}-${Environment}-pipeline
+      RoleArn:
+        Fn::ImportValue: !Sub ${Environment}-CodePipelineRoleArn
+      ArtifactStore:
+        Type: S3
+        Location:
+          Fn::ImportValue: !Sub ${Environment}-PipelineBucketName
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: S3Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: "1"
+              Configuration:
+                S3Bucket:
+                  Fn::ImportValue: !Sub ${Environment}-ArtifactsBucketName
+                # Note: This key must match what GitHub Actions uploads
+                S3ObjectKey: !Sub ${Environment}/${ApplicationName}-${Environment}.zip
+                PollForSourceChanges: "true"
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Deploy
+          Actions:
+            - Name: CodeDeploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: "1"
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref CodeDeployDeploymentGroup
+              InputArtifacts:
+                - Name: SourceOutput
+
+Outputs:
+  PipelineUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view
+    Description: URL of the created CodePipeline
