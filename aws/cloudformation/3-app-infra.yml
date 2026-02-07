@@ -168,6 +168,12 @@ Resources:
         - Key: Name
           Value: !Sub ${ApplicationName}-${Environment}-instance
           PropagateAtLaunch: true
+      UpdatePolicy:
+        AutoScalingRollingUpdate:
+          MinInstancesInService: 1       
+          MaxBatchSize: 1                
+          PauseTime: PT90S                
+          WaitOnResourceSignals: false   
 
 Outputs:
   ALBDNSName:

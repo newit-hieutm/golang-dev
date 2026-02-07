@@ -1,0 +1,148 @@
+name: Rollback Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to rollback'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      target_version:
+        description: 'Version to rollback to (leave empty for previous successful deployment)'
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  APP_NAME: myapp
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Determine rollback target
+        id: target
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          S3_BUCKET: ${{ secrets.S3_ARTIFACT_BUCKET }}
+        run: |
+          S3_KEY="${ENV_NAME}/${APP_NAME}-${ENV_NAME}.zip"
+
+          # Get deployment history
+          HISTORY=$(aws ssm get-parameter \
+            --name "/${APP_NAME}/${ENV_NAME}/deployments/history" \
+            --query 'Parameter.Value' \
+            --output text)
+
+          if [[ -z "${HISTORY}" || "${HISTORY}" == "[]" ]]; then
+            echo "❌ No deployment history found!"
+            exit 1
+          fi
+
+          if [[ -n "${{ inputs.target_version }}" ]]; then
+            # User specified version
+            TARGET=$(echo "${HISTORY}" | jq -r \
+              --arg ver "${{ inputs.target_version }}" \
+              '.[] | select(.version == $ver)')
+
+            if [[ -z "${TARGET}" ]]; then
+              echo "❌ Version ${{ inputs.target_version }} not found!"
+              echo "Available versions:"
+              echo "${HISTORY}" | jq -r '.[] | "\(.version) (\(.commit)) - \(.deploymentTime)"'
+              exit 1
+            fi
+          else
+            # Get second-to-last deployment (last = current, second = previous)
+            TARGET=$(echo "${HISTORY}" | jq -r '.[-2]')
+
+            if [[ "${TARGET}" == "null" || -z "${TARGET}" ]]; then
+              echo "❌ No previous deployment found!"
+              exit 1
+            fi
+          fi
+
+          VERSION=$(echo "${TARGET}" | jq -r '.version')
+          COMMIT=$(echo "${TARGET}" | jq -r '.commit')
+          S3_VERSION_ID=$(echo "${TARGET}" | jq -r '.s3VersionId')
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "commit=${COMMIT}" >> $GITHUB_OUTPUT
+          echo "s3_version_id=${S3_VERSION_ID}" >> $GITHUB_OUTPUT
+          echo "s3_key=${S3_KEY}" >> $GITHUB_OUTPUT
+
+          echo "🔄 Rollback target: ${VERSION} (${COMMIT})"
+          echo "   S3 Version ID: ${S3_VERSION_ID}"
+
+      - name: Verify S3 version exists
+        env:
+          S3_BUCKET: ${{ secrets.S3_ARTIFACT_BUCKET }}
+        run: |
+          if ! aws s3api head-object \
+            --bucket "${S3_BUCKET}" \
+            --key "${{ steps.target.outputs.s3_key }}" \
+            --version-id "${{ steps.target.outputs.s3_version_id }}" \
+            > /dev/null 2>&1; then
+            echo "❌ S3 object version not found!"
+            exit 1
+          fi
+          echo "✅ S3 version verified"
+
+      - name: Trigger rollback deployment
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          S3_BUCKET: ${{ secrets.S3_ARTIFACT_BUCKET }}
+        run: |
+          # Copy old version to current path (creates new version, triggers pipeline)
+          aws s3api copy-object \
+            --bucket "${S3_BUCKET}" \
+            --copy-source "${S3_BUCKET}/${{ steps.target.outputs.s3_key }}?versionId=${{ steps.target.outputs.s3_version_id }}" \
+            --key "${{ steps.target.outputs.s3_key }}"
+
+          echo "✅ S3 object restored to version ${{ steps.target.outputs.version }}"
+
+          # Trigger CodePipeline
+          PIPELINE_NAME="${APP_NAME}-${ENV_NAME}-pipeline"
+          EXECUTION_ID=$(aws codepipeline start-pipeline-execution \
+            --name "${PIPELINE_NAME}" \
+            --query 'pipelineExecutionId' \
+            --output text)
+
+          echo "🚀 Pipeline triggered: ${EXECUTION_ID}"
+
+          # Create summary
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🔄 Rollback Executed
+
+          | Property | Value |
+          |----------|-------|
+          | Environment | \`${ENV_NAME}\` |
+          | Rolled back to | \`${{ steps.target.outputs.version }}\` |
+          | Commit | \`${{ steps.target.outputs.commit }}\` |
+          | S3 Version ID | \`${{ steps.target.outputs.s3_version_id }}\` |
+          | Triggered by | @${{ github.actor }} |
+          | Pipeline Execution | \`${EXECUTION_ID}\` |
+
+          [View Pipeline](https://${AWS_REGION}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${PIPELINE_NAME}/view)
+
+          ⚠️ **Monitor the rollback deployment carefully!**
+
+          Verify the rolled-back version after deployment:
+          \`\`\`bash
+          curl https://YOUR_ALB_DNS/version
+          \`\`\`
+          EOF

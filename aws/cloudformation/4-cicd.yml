@@ -8,6 +8,13 @@ Parameters:
   Environment:
     Type: String
     Default: staging
+    AllowedValues:
+      - staging
+      - production
+    Description: Environment name (staging or production)
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
 
 Resources:
   # ==========================================
@@ -26,13 +33,24 @@ Resources:
       DeploymentGroupName: !Sub ${ApplicationName}-${Environment}-dg
       ServiceRoleArn:
         Fn::ImportValue: !Sub ${Environment}-CodeDeployRoleArn
-      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      # Production: OneAtATime (safe, zero-downtime)
+      # Staging: AllAtOnce (fast deployment for testing)
+      DeploymentConfigName: !If
+        - IsProduction
+        - CodeDeployDefault.OneAtATime
+        - CodeDeployDefault.AllAtOnce
       AutoScalingGroups:
         - Fn::ImportValue: !Sub ${Environment}-ASGName
       LoadBalancerInfo:
         TargetGroupInfoList:
           - Name:
               Fn::ImportValue: !Sub ${Environment}-TargetGroupName
+      # Automatic rollback on any deployment failure
+      # Triggers when any lifecycle hook fails (stop, install, start, validate)
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
 
   # ==========================================
   # CodePipeline
@@ -61,9 +79,21 @@ Resources:
                   Fn::ImportValue: !Sub ${Environment}-ArtifactsBucketName
                 # Note: This key must match what GitHub Actions uploads
                 S3ObjectKey: !Sub ${Environment}/${ApplicationName}-${Environment}.zip
-                PollForSourceChanges: "true"
+                PollForSourceChanges: "false"
               OutputArtifacts:
                 - Name: SourceOutput
+        - !If
+          - IsProduction
+          - Name: Approve
+            Actions:
+              - Name: ManualApproval
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Provider: Manual
+                  Version: "1"
+                RunOrder: 1
+          - !Ref AWS::NoValue
         - Name: Deploy
           Actions:
             - Name: CodeDeploy

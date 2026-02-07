@@ -37,7 +37,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
         with:
-          go-version: "1.21"
+          go-version-file: go.mod
+          cache: true
 
       - name: Run tests
         run: make test
@@ -59,7 +60,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
         with:
-          go-version: "1.21"
+          go-version-file: go.mod
+          cache: true
 
       - name: Get version info
         id: version
@@ -108,15 +110,28 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Deploy to S3 and trigger pipeline
+        id: deploy_s3
         env:
           ENV_NAME: ${{ inputs.environment || 'staging' }}
           S3_BUCKET: ${{ secrets.S3_ARTIFACT_BUCKET }}
         run: |
+          S3_KEY="${ENV_NAME}/${APP_NAME}-${ENV_NAME}.zip"
+
           # Upload artifact to S3
-          aws s3 cp artifact.zip "s3://${S3_BUCKET}/${ENV_NAME}/${APP_NAME}-${ENV_NAME}.zip"
+          aws s3 cp artifact.zip "s3://${S3_BUCKET}/${S3_KEY}"
+
+          # Get S3 Version ID of uploaded object
+          VERSION_ID=$(aws s3api head-object \
+            --bucket "${S3_BUCKET}" \
+            --key "${S3_KEY}" \
+            --query 'VersionId' \
+            --output text)
+
+          echo "s3_version_id=${VERSION_ID}" >> $GITHUB_OUTPUT
+          echo "✅ Uploaded with S3 Version ID: ${VERSION_ID}"
 
           # Verify upload
-          if ! aws s3 ls "s3://${S3_BUCKET}/${ENV_NAME}/${APP_NAME}-${ENV_NAME}.zip"; then
+          if ! aws s3 ls "s3://${S3_BUCKET}/${S3_KEY}"; then
             echo "Error: Artifact not found on S3 after upload!"
             exit 1
           fi
@@ -139,8 +154,60 @@ jobs:
           | Environment | \`${ENV_NAME}\` |
           | Version | \`${{ needs.build.outputs.version }}\` |
           | Commit | \`${{ needs.build.outputs.commit }}\` |
+          | S3 Version ID | \`${VERSION_ID}\` |
           | Pipeline | \`${PIPELINE_NAME}\` |
           | Execution ID | \`${EXECUTION_ID}\` |
 
           [View Pipeline](https://${AWS_REGION}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${PIPELINE_NAME}/view)
           EOF
+
+      - name: Save deployment metadata
+        if: success()
+        env:
+          ENV_NAME: ${{ inputs.environment || 'staging' }}
+        run: |
+          TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+          # Create deployment record
+          DEPLOYMENT_RECORD=$(jq -n \
+            --arg version "${{ needs.build.outputs.version }}" \
+            --arg commit "${{ needs.build.outputs.commit }}" \
+            --arg buildTime "${{ needs.build.outputs.build_time }}" \
+            --arg s3VersionId "${{ steps.deploy_s3.outputs.s3_version_id }}" \
+            --arg deploymentTime "${TIMESTAMP}" \
+            --arg triggeredBy "github-actions" \
+            --arg githubRunId "${{ github.run_id }}" \
+            '{
+              version: $version,
+              commit: $commit,
+              buildTime: $buildTime,
+              s3VersionId: $s3VersionId,
+              deploymentTime: $deploymentTime,
+              triggeredBy: $triggeredBy,
+              githubRunId: $githubRunId,
+              status: "deployed"
+            }')
+
+          # Save latest deployment
+          aws ssm put-parameter \
+            --name "/${APP_NAME}/${ENV_NAME}/deployments/latest" \
+            --value "${DEPLOYMENT_RECORD}" \
+            --type String \
+            --overwrite
+
+          # Update deployment history (keep last 10)
+          HISTORY=$(aws ssm get-parameter \
+            --name "/${APP_NAME}/${ENV_NAME}/deployments/history" \
+            --query 'Parameter.Value' \
+            --output text 2>/dev/null || echo '[]')
+
+          NEW_HISTORY=$(echo "${HISTORY}" | jq --argjson new "${DEPLOYMENT_RECORD}" \
+            '. + [$new] | .[-10:]')
+
+          aws ssm put-parameter \
+            --name "/${APP_NAME}/${ENV_NAME}/deployments/history" \
+            --value "${NEW_HISTORY}" \
+            --type String \
+            --overwrite
+
+          echo "✅ Deployment metadata saved to SSM Parameter Store"

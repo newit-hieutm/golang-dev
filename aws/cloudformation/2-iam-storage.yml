@@ -127,7 +127,6 @@ Resources:
                   - !Sub arn:aws:s3:::${ArtifactsBucket}
                   - !Sub arn:aws:s3:::${PipelineBucket}/*
                   - !Sub arn:aws:s3:::${PipelineBucket}
-                  - !Sub arn:aws:s3:::elasticbeanstalk*
               - Effect: Allow
                 Action:
                   - codedeploy:CreateDeployment
@@ -135,7 +134,10 @@ Resources:
                   - codedeploy:GetDeploymentConfig
                   - codedeploy:RegisterApplicationRevision
                   - codedeploy:GetApplicationRevision
-                Resource: "*"
+                Resource:
+                  - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${ApplicationName}-${Environment}*
+                  - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ApplicationName}-${Environment}*
+                  - !Sub arn:aws:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:*
 
   # ==========================================
   # GitHub Actions OIDC
@@ -185,6 +187,8 @@ Resources:
                   - s3:PutObject
                   - s3:GetObject
                   - s3:ListBucket
+                  - s3:GetObjectVersion
+                  - s3:ListBucketVersions
                 Resource:
                   - !Sub arn:aws:s3:::${ArtifactsBucket}/*
                   - !Sub arn:aws:s3:::${ArtifactsBucket}
@@ -198,6 +202,18 @@ Resources:
                   - codepipeline:GetPipelineExecution
                   - codepipeline:GetPipelineState
                 Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${ApplicationName}-${Environment}-pipeline
+        - PolicyName: GitHubActionsSSMPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParameterHistory
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ApplicationName}/${Environment}/deployments/*
 
 Outputs:
   ArtifactsBucketName:
